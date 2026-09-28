@@ -1,0 +1,190 @@
+# Pipeline de validación: fmt, validate, tflint, checkov y plan en pull requests
+name: terraform-plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - "bootstrap/**"
+      - "policies/**"
+      - ".terraform-version"
+      - ".tflint.hcl"
+      - ".github/actions/terraform-init/**"
+      - ".github/workflows/terraform-plan.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  secrets-scan:
+    name: Escaneo de secretos
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Instalar gitleaks (verificando checksum)
+        run: |
+          set -euo pipefail
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$file"
+          echo "${GITLEAKS_SHA256}  $file" | sha256sum -c -
+          tar -xzf "$file" gitleaks
+
+      # Revisa todos los commits del PR, no solo el estado final
+      - name: gitleaks
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./gitleaks git --redact --verbose --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+
+  static-checks:
+    name: Validaciones estáticas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Versión de Terraform
+        id: tf
+        run: echo "version=$(tr -d '[:space:]' < .terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ steps.tf.outputs.version }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        run: |
+          set -euo pipefail
+          for dir in environments/*/ bootstrap/*/; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@1cf010d3c7aef302051ccdb68c14c5dc2efa34ef # v6.3.1
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@444c9db6fa75e2d9c19ebf1fde7322089be9009e # v12.3125.0
+        with:
+          directory: .
+          framework: terraform
+          config_file: policies/checkov-skip.yml
+          quiet: true
+          compact: true
+
+  environments:
+    name: Detectar entornos
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: list
+        run: |
+          list=$(find environments -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | jq -R . | jq -cs .)
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: plan (${{ matrix.environment }})
+    needs: [secrets-scan, static-checks, environments]
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.environments.outputs.list) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: terraform init
+        id: init
+        uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ matrix.environment }}
+          role-to-assume: ${{ fromJSON(vars.AWS_PLAN_ROLE_ARNS || '{}')[matrix.environment] }}
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ steps.init.outputs.working-directory }}
+        run: |
+          set +e
+          terraform plan -input=false -lock-timeout=5m -no-color -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "has-changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has-changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Comentar plan en el PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          PLAN_FILE: ${{ steps.init.outputs.working-directory }}/plan.txt
+          HAS_CHANGES: ${{ steps.plan.outputs.has-changes }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const marker = `<!-- terraform-plan:${env} -->`;
+            const limit = 60000;
+
+            let plan = fs.readFileSync(process.env.PLAN_FILE, 'utf8');
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit) + '\n... (truncado, ver el log del job)';
+            }
+
+            const status = process.env.HAS_CHANGES === 'true' ? 'con cambios' : 'sin cambios';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              `### Terraform plan \`${env}\`: ${status}`,
+              `Commit \`${context.sha.slice(0, 7)}\` · [ejecución](${runUrl})`,
+              '<details><summary>Ver plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body?.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }

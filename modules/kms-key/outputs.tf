@@ -1,0 +1,16 @@
+# Outputs del módulo kms-key
+
+output "arn" {
+  description = "ARN de la clave KMS."
+  value       = aws_kms_key.this.arn
+}
+
+output "key_id" {
+  description = "ID de la clave KMS."
+  value       = aws_kms_key.this.key_id
+}
+
+output "alias_name" {
+  description = "Alias de la clave."
+  value       = aws_kms_alias.this.name
+}

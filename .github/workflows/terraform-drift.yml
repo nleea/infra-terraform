@@ -1,0 +1,84 @@
+name: terraform-drift
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5" # 06:00 hora de Colombia, lunes a viernes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  environments:
+    name: Detectar entornos
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: list
+        run: |
+          list=$(find environments -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | jq -R . | jq -cs .)
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  drift:
+    name: drift (${{ matrix.environment }})
+    needs: environments
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.environments.outputs.list) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: terraform init
+        id: init
+        uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ matrix.environment }}
+          role-to-assume: ${{ fromJSON(vars.AWS_PLAN_ROLE_ARNS || '{}')[matrix.environment] }}
+
+      - name: terraform plan (solo lectura)
+        id: plan
+        working-directory: ${{ steps.init.outputs.working-directory }}
+        run: |
+          set +e
+          terraform plan -input=false -lock=false -no-color -detailed-exitcode > plan.txt
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "drift=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "drift=true" >> "$GITHUB_OUTPUT" ;;
+            *) cat plan.txt; exit "$code" ;;
+          esac
+
+      - name: Abrir o actualizar issue de drift
+        if: steps.plan.outputs.drift == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          PLAN_FILE: ${{ steps.init.outputs.working-directory }}/plan.txt
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const title = `Drift detectado en ${env}`;
+            const plan = fs.readFileSync(process.env.PLAN_FILE, 'utf8').slice(-60000);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `La infraestructura de \`${env}\` no coincide con \`main\` ([ejecución](${runUrl})).`,
+              'Revisa si hubo cambios manuales en la consola y corrígelos con un PR.',
+              '<details><summary>Plan</summary>', '', '```hcl', plan, '```', '</details>',
+            ].join('\n');
+            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: 'open', labels: 'drift' });
+            const existing = open.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ ...context.repo, title, body, labels: ['drift'] });
+            }

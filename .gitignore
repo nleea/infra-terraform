@@ -1,0 +1,28 @@
+# Directorios locales de Terraform
+.terraform/
+
+# Estado
+*.tfstate
+*.tfstate.*
+
+# Logs y planes
+crash.log
+crash.*.log
+*.tfplan
+
+# Overrides locales
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Configuración de CLI
+.terraformrc
+terraform.rc
+
+*.tfvars
+# Config no sensible de cada entorno: el pipeline lee aws_region de aquí
+!environments/*/terraform.tfvars
+docs/*.md
+# macOS
+.DS_Store

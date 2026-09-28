@@ -1,0 +1,11 @@
+
+# Uso: checkov -d . --config-file policies/checkov-skip.yml
+skip-check:
+  - CKV_AWS_144
+  - CKV_AWS_18
+  - CKV2_AWS_62
+  - CKV_AWS_338
+  - CKV_AWS_150
+  - CKV_AWS_293
+  - CKV_AWS_157
+  - CKV_AWS_133

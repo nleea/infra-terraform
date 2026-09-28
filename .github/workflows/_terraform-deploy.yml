@@ -1,0 +1,90 @@
+# Workflow reutilizable: plan con el rol de lectura y apply del mismo plan con aprobación del GitHub Environment
+name: terraform-deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Entorno a desplegar (carpeta en environments/ y GitHub Environment)
+        type: string
+        required: true
+
+jobs:
+  plan:
+    name: plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: terraform init
+        id: init
+        uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ inputs.environment }}
+          role-to-assume: ${{ fromJSON(vars.AWS_PLAN_ROLE_ARNS || '{}')[inputs.environment] }}
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ steps.init.outputs.working-directory }}
+        run: |
+          set +e
+          terraform plan -input=false -lock-timeout=5m -no-color -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "has-changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has-changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+          {
+            echo "### Terraform plan \`${{ inputs.environment }}\`"
+            echo '```hcl'
+            terraform show -no-color tfplan | head -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # El plan puede contener valores sensibles: retención mínima
+      - name: Guardar plan
+        if: steps.plan.outputs.has-changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.init.outputs.working-directory }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  apply:
+    name: apply (${{ inputs.environment }})
+    needs: plan
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    # Las reglas de protección del Environment (revisores) dan la aprobación manual
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: terraform init
+        id: init
+        uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ inputs.environment }}
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+
+      - name: Descargar plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.init.outputs.working-directory }}
+
+      # Aplica exactamente el plan aprobado; si el estado cambió, Terraform lo rechaza por obsoleto
+      - name: terraform apply
+        working-directory: ${{ steps.init.outputs.working-directory }}
+        run: terraform apply -input=false -lock-timeout=5m -no-color tfplan

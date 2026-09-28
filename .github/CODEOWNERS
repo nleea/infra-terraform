@@ -1,0 +1,9 @@
+# Revisores obligatorios por ruta (requiere "Require review from Code Owners" en la protección de main)
+*                       @nleea
+
+# Cambios que afectan a producción o a los permisos de despliegue
+/environments/prod/     @nleea
+/bootstrap/             @nleea
+/modules/terraform-bootstrap/ @nleea
+/.github/               @nleea
+/policies/              @nleea
